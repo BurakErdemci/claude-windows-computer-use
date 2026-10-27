@@ -1,0 +1,268 @@
+"""Permission-boundary validation, independent of driver availability."""
+import pytest
+
+from conftest import NOTEPAD_ID
+from windows_computer_use import platform, policy as p
+from windows_computer_use.platform.windows import DENY
+
+TOOLS_DIR = "win:c:" + chr(92) + "tools" + chr(92)
+
+
+@pytest.fixture(autouse=True)
+def _platform(fake_win32):
+    return fake_win32
+
+
+@pytest.fixture
+def all_tools(monkeypatch):
+    # Launch and menu tools are refused up front on Windows; this exposes their argument validation.
+    monkeypatch.setattr(platform.current(), "unsupported_tools", frozenset())
+
+
+def refused(tool, args, key=None):
+    result = p.validate_call(tool, args)
+    assert isinstance(result, p.Refusal)
+    if key:
+        assert key in result.reason
+
+
+@pytest.mark.parametrize("tool,args,key", [
+    ("computer_run_script", {}, None), ("computer_click", [], "args"),
+    ("computer_click", {}, "pid"),
+    *[("computer_click", {"pid": value}, "pid") for value in (True, False, 0, -1, "4", 1.5, None)],
+    *[("computer_click", {"pid": 4, key: "x"}, key) for key in ("session", "scope", "target", "debug_image_out", "app", "bundle_id")],
+    ("computer_window_state", {"pid": 4, "window_id": 1, "screenshot_out_file": "output"}, "screenshot_out_file"),
+    ("computer_window_state", {"pid": 4}, "window_id"),
+    ("computer_bring_to_front", {}, "pid"),
+    ("computer_bring_to_front", {"pid": 4, "session": "x"}, "session"),
+    *[("computer_confirm_risky_step", {"pid": 4, "summary": value}, "summary") for value in ("", "x" * 501, 4, None)],
+])
+def test_refusals(tool, args, key):
+    refused(tool, args, key)
+
+
+@pytest.mark.parametrize("tool,args", [
+    ("computer_launch_app", {"bundle_id": NOTEPAD_ID}),
+    ("computer_invoke_menu", {"pid": 4, "window_id": 1, "path": ["File"]}),
+])
+def test_tools_unsupported_on_windows_are_refused(tool, args):
+    refused(tool, args, "not available")
+
+
+@pytest.mark.parametrize("key", ["name", "urls", "additional_arguments", "webkit_inspector_port", "session"])
+def test_launch_refuses_unknown_arguments(all_tools, key):
+    refused("computer_launch_app", {"bundle_id": NOTEPAD_ID, key: "x"}, key)
+
+
+def test_launch_refuses_empty_bundle_id(all_tools):
+    refused("computer_launch_app", {"bundle_id": ""}, "bundle_id")
+
+
+def test_schema_table_matches_pinned_surface():
+    assert len(p.TOOLS) == 20
+    assert "capture_id" in p.TOOLS["computer_click"].allowed
+    assert "capture_id" not in p.TOOLS["computer_double_click"].allowed
+    assert "capture_id" not in p.TOOLS["computer_right_click"].allowed
+    assert p.validate_call("computer_list_apps", {}).args == {}
+    for name, spec in p.TOOLS.items():
+        assert not spec.allowed.intersection({"session", "scope", "target", "debug_image_out", "screenshot_out_file"})
+    for name in DENY:
+        assert p.is_hard_denied(TOOLS_DIR + name.upper())
+    assert not p.is_hard_denied(NOTEPAD_ID)
+
+
+@pytest.mark.parametrize("args", [{"pid": 4}, {"pid": 4, "window_id": 9}])
+def test_bring_to_front_accepts_pid_and_optional_window(args):
+    result = p.validate_call("computer_bring_to_front", args)
+    assert isinstance(result, p.Validated)
+    assert result.driver_tool == "bring_to_front"
+    assert result.args == args
+
+
+@pytest.mark.parametrize("step", [
+    {"tool": "click", "args": {"app": "Terminal"}},
+    {"click": {"window": "Terminal"}},
+    {"click": {"scope": "desktop"}},
+    {"click": {"target": {"kind": "desktop"}}},
+    {"click": {"pid": 5}}, {"click": {"window_id": 8}},
+    {"click": {}, "expect": [{"app": "Terminal"}]},
+    {"click": {}, "wait_for": {"window": "x"}},
+    {"wait_for": [{"pid": 5}]}, {"expect": [{"window_id": 8}]},
+    {"expect": [{}] * 5}, {"wait_for": "text"},
+    {"click": {}, "double_click": {}},
+    {"tool": "click", "args": {}, "click": {}},
+    {"move_cursor": {"x": 1}}, {"tool": "move_cursor", "args": {}},
+    {"tool": []}, {"click": []}, {"app": "x", "expect": {}},
+    {"args": {"app": "Terminal"}, "expect": {}}, {}, "bad", None,
+    {"tool": "type_text", "args": {}},
+    {"tool": "bring_to_front"},
+])
+def test_nested_step_refusals(step):
+    refused("computer_run_steps", {"pid": 4, "window_id": 7, "steps": [step]})
+
+
+@pytest.mark.parametrize("args,key", [
+    ({"steps": []}, "steps"), ({"steps": [{}] * 65}, "steps"),
+    ({"steps": {}}, "steps"), ({"app": "Terminal"}, "app"),
+    ({"window": "Terminal"}, "window"),
+    ({"observe": {"pid": 5}}, "pid"),
+    ({"observe": {"app": "Terminal"}}, "app"),
+    ({"observe": {"screenshot_out_file": "output"}}, "screenshot_out_file"),
+])
+def test_batch_refusals(args, key):
+    refused("computer_run_steps", {"pid": 4, "steps": [{"click": {}}], **args}, key)
+
+
+def test_batch_accepts_shorthand_explicit_and_check_only_unchanged():
+    steps = [
+        {"click": {"role": "button", "name": "OK", "pid": 4, "window_id": 7}},
+        {"tool": "type_text", "args": {"text": "hello", "nth": 2, "timeout_ms": 500}},
+        {"wait_for": {"text": "hello"}, "expect": [{"selected": True}]},
+    ]
+    args = {"pid": 4, "window_id": 7, "steps": steps, "observe": {"include_screenshot": True}}
+    assert p.validate_call("computer_run_steps", args).args is args
+
+
+@pytest.mark.parametrize("keys", [
+    ["delete", "SHIFT"], ["Shift", "Control", "Delete"],
+    ["ctrl", "shift", "delete"], ["del", "shift", "cmd"],
+    ["f4", "ALT"], ["F4", "Option"], ["alt", "f4"], ["f4", "opt", "shift"],
+])
+def test_risky_alias_order_and_batch_detection(keys):
+    assert p.risky_reason("computer_hotkey", {"keys": keys})
+    assert p.risky_reason("computer_press_key", {"key": keys[0], "modifiers": keys[1:]})
+    for step in ({"hotkey": {"keys": keys}}, {"tool": "hotkey", "args": {"keys": keys}}):
+        assert p.risky_reason("computer_run_steps", {"steps": [step]})
+
+
+def test_risk_is_exact_key_set():
+    for keys in (["cmd", "s"], ["cmd", "delete", "ctrl"], ["delete"], ["f4"], ["alt"]):
+        assert p.risky_reason("computer_hotkey", {"keys": keys}) == ""
+    assert p.risky_reason("computer_confirm_risky_step", {"summary": "Send message"}) == "Send message"
+
+
+@pytest.mark.parametrize("value", [None, 7, "", " " + NOTEPAD_ID, NOTEPAD_ID + " ",
+                                  NOTEPAD_ID + "\n", "win:c:\\\x01app.exe", "a b", "a" * 256,
+                                  NOTEPAD_ID.upper(), r"win:c:\apps\..\evil.exe",
+                                  "win:c:\\" + "a" * 256 + ".exe"])
+def test_malformed_bundle_ids(all_tools, value):
+    assert not p.valid_bundle_id(value)
+    refused("computer_launch_app", {"bundle_id": value}, "bundle_id")
+
+
+@pytest.mark.parametrize("value", [r"win:c:\a.exe", NOTEPAD_ID, "win:c:\\" + "a" * 255 + ".exe"])
+def test_valid_bundle_id_boundaries(value):
+    assert p.valid_bundle_id(value)
+
+
+@pytest.mark.parametrize("name", [
+    "1password.exe", "bitwarden.exe", "dashlanelauncher.exe", "lastpass.exe", "nordpass.exe",
+    "keepassxc.exe", "powershell.exe", "pwsh.exe", "wscript.exe", "regedit.exe", "cmd.exe",
+    "explorer.exe", "python.exe", "claude.exe", "systemsettings.exe", "taskmgr.exe",
+])
+def test_sensitive_and_scripting_apps_are_hard_denied(name):
+    assert p.is_hard_denied(TOOLS_DIR + name.upper())
+    assert p.is_hard_denied(TOOLS_DIR + name)
+
+
+def test_window_listing_requires_pid():
+    refused("computer_list_windows", {}, "pid")
+    assert isinstance(p.validate_call("computer_list_windows", {"pid": 4}), p.Validated)
+
+
+@pytest.mark.parametrize("urls", [["https://example.com", "http://example.com", "/Users/me/Unity Projeleri"],
+                                 ["/Users/me/Documents"], ["https://example.com"] * 16])
+def test_launch_accepts_only_opened_url_capabilities(all_tools, urls):
+    args = {"bundle_id": NOTEPAD_ID, "urls": urls}
+    assert p.validate_call("computer_launch_app", args).args is args
+
+
+@pytest.mark.parametrize("urls", [[], ["https://example.com"] * 17, "https://example.com", [7],
+                                 ["relative/path"], ["javascript:alert(1)"],
+                                 ["x-apple.systempreferences:settings"], ["https://[bad"]])
+def test_launch_refuses_bad_urls(all_tools, urls):
+    refused("computer_launch_app", {"bundle_id": NOTEPAD_ID, "urls": urls}, "urls")
+
+
+@pytest.mark.parametrize("url", [
+    " https://x.com", "ht\ntps://x.com", "http\r://x.com", "http:", "file:",
+    "https://", "https://x.com/\x00", "https://x.com/a b", "https://x.com/é",
+    "https://x.com/\x7f", "file:relative", "file://host", "", "x" * 2049,
+    "https://x.com/" + "a" * 1020, "/" + "a" * 1024,
+    "file:///Users/me", "file:///Users/me/Documents", "FILE:///x", "/Users/me/../../etc",
+    "/Users/me/./x", "/Users/me/..", " /Users/me", "/Users/me ", "/Users/me\n", "/a\x00b",
+    "/a\u200bb", "/a\u202eb", "/a\tb", "~/Documents", "relative/path",
+    "javascript:alert(1)", "x-apple.systempreferences:a",
+])
+def test_launch_url_syntax_rejects_ambiguous_or_nonprintable_targets(all_tools, url):
+    refused("computer_launch_app", {"bundle_id": NOTEPAD_ID, "urls": [url]}, "urls")
+
+
+@pytest.mark.parametrize("url", ["https://example.com/a?b=c", "http://example.com",
+                                "/Users/me/Documents", "/Users/me/Unity Projeleri",
+                                "/Users/me/Documents/unityaıPython", "https://x.com/" + "a" * 1000])
+def test_launch_url_syntax_accepts_documented_forms(all_tools, url):
+    assert isinstance(p.validate_call("computer_launch_app", {
+        "bundle_id": NOTEPAD_ID, "urls": [url]}), p.Validated)
+
+
+@pytest.mark.parametrize("value", [1, 0, None, "yes", [], {}])
+def test_clipboard_read_include_text_requires_boolean(value):
+    refused("computer_clipboard_read", {"include_text": value}, "include_text")
+
+
+def test_clipboard_identifier_and_boolean_flags():
+    assert p.CLIPBOARD_BUNDLE_ID == "windows-computer-use.clipboard"
+    assert p.valid_bundle_id(p.CLIPBOARD_BUNDLE_ID)
+    assert not p.is_hard_denied(p.CLIPBOARD_BUNDLE_ID)
+    for flag in (True, False):
+        assert isinstance(p.validate_call("computer_clipboard_read", {"include_text": flag}), p.Validated)
+
+
+def test_clipboard_is_text_only():
+    assert isinstance(p.validate_call("computer_clipboard_read", {"include_text": True}), p.Validated)
+    assert isinstance(p.validate_call("computer_clipboard_write", {"text": ""}), p.Validated)
+    refused("computer_clipboard_write", {}, "text")
+    refused("computer_clipboard_write", {"text": 7}, "text")
+    for key in ("file_path", "image_path", "session", "pid"):
+        refused("computer_clipboard_write", {"text": "hello", key: "value"}, key)
+
+
+# Independently pinned numeric fields. Exercise every exposed occurrence, plus
+# the same fields in action steps and window-state observations.
+NUMERIC_FIELDS = "pid window_id count x y x1 y1 x2 y2 from_x from_y to_x to_y duration_ms amount delay_ms max_depth max_elements max_image_dimension max_dimension timeout_ms".split()
+NUMERIC_CASES = [(tool, key) for tool, spec in p.TOOLS.items()
+                 for key in NUMERIC_FIELDS if key in spec.allowed]
+NUMERIC_CASES.append(("computer_drag", "steps"))
+
+
+@pytest.mark.parametrize("tool,key", NUMERIC_CASES)
+@pytest.mark.parametrize("value", [True, False])
+def test_booleans_refused_for_all_numeric_arguments(all_tools, tool, key, value):
+    args = {name: 1 for name in p.TOOLS[tool].required}
+    args.update(pid=4)
+    if tool == "computer_run_steps":
+        args["steps"] = [{"click": {}}]
+    if tool == "computer_hotkey":
+        args["keys"] = ["cmd", "s"]
+    args[key] = value
+    refused(tool, args, key)
+    driver_tool = p.TOOLS[tool].driver_tool
+    if driver_tool in p.STEP_TOOLS:
+        refused("computer_run_steps", {"pid": 4, "window_id": 7,
+                                       "steps": [{driver_tool: args}]}, key)
+    if tool == "computer_window_state":
+        refused("computer_run_steps", {"pid": 4, "window_id": 7,
+                                       "steps": [{"click": {}}], "observe": args}, key)
+
+
+@pytest.mark.parametrize("step", [{"click": {"nth": True}}, {"click": {"timeout_ms": False}},
+                                 {"click": {}, "timeout_ms": True},
+                                 {"expect": {"timeout_ms": True}}])
+def test_named_target_and_check_numbers_refuse_booleans(step):
+    refused("computer_run_steps", {"pid": 4, "steps": [step]})
+
+
+def test_launch_refuses_reserved_clipboard_bundle_id_case_insensitively(all_tools):
+    for bundle in (p.CLIPBOARD_BUNDLE_ID, p.CLIPBOARD_BUNDLE_ID.upper()):
+        refused("computer_launch_app", {"bundle_id": bundle}, "bundle_id")

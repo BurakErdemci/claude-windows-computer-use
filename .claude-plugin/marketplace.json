@@ -1,0 +1,12 @@
+{
+  "name": "windows-computer-use",
+  "owner": { "name": "Burak Erdemci" },
+  "metadata": { "description": "Windows desktop computer use for Claude Code with owner confirmation for critical actions." },
+  "plugins": [
+    {
+      "name": "windows-computer-use",
+      "source": "./",
+      "description": "Windows desktop computer use with owner confirmation for critical actions."
+    }
+  ]
+}

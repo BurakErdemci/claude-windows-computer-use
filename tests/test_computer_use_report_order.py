@@ -1,0 +1,73 @@
+"""Batch headers remain readable when a long serialized step list is truncated."""
+import asyncio
+import json
+import os
+import sys
+from pathlib import Path
+from unittest.mock import AsyncMock
+
+import pytest
+
+from conftest import FakeApprovals
+from windows_computer_use import driver_client
+from windows_computer_use.driver_client import DriverClient
+from windows_computer_use.server import ComputerServer
+
+
+@pytest.fixture
+def fake(tmp_path, monkeypatch, fake_win32):
+    # At most one fake driver process per test; run_batch always closes it.
+    fixture = Path(__file__).parent / "fixtures" / "fake_cua_driver.py"
+    transport = driver_client._transport
+
+    def fake_transport(command, env):
+        child_env = dict(env)
+        if "SYSTEMROOT" in os.environ:
+            child_env["SYSTEMROOT"] = os.environ["SYSTEMROOT"]
+        return transport([sys.executable, str(fixture), *command[1:]], child_env)
+
+    monkeypatch.setattr(driver_client, "_transport", fake_transport)
+    executable = Path(sys.executable)
+    log = tmp_path / "calls.jsonl"
+    socket = str(tmp_path / "fake-private-socket")
+    driver = DriverClient(str(executable), socket)
+    driver.env["FAKE_CUA_LOG"] = str(log)
+    return driver, AsyncMock(return_value=(str(executable), socket))
+
+
+def run_batch(fake, stop):
+    driver, runtime = fake
+
+    async def run():
+        approvals = FakeApprovals()
+        approvals.batch_stop = AsyncMock(side_effect=stop)
+        handler = ComputerServer(driver, approvals, runtime=runtime)
+        try:
+            return await handler.call("computer_run_steps", {
+                "pid": 4242,
+                "steps": [{"type_text": {"text": str(i)}} for i in range(3)],
+                "observe": {},
+            })
+        finally:
+            await handler.close()
+
+    return json.loads(asyncio.run(run()).content[0].text)
+
+
+def test_unstopped_header_precedes_steps_and_observation(fake):
+    report = run_batch(fake, [None] * 3)
+    assert list(report) == ["executed", "total", "failed_step", "ok", "steps", "observation"]
+    assert report["executed"] == report["total"] == 3
+    assert report["failed_step"] is None and report["ok"] is True
+    assert len(report["steps"]) == 3
+
+
+def test_stopped_header_keeps_halt_fields_first(fake):
+    report = run_batch(fake, [None, "halted"])
+    assert list(report) == [
+        "halted", "stop_reason", "halt_reason", "executed", "total", "failed_step", "ok", "steps",
+    ]
+    assert report["executed"] == 1 and report["total"] == 3
+    assert report["halted"] is True and report["stop_reason"] == "halted"
+    assert report["failed_step"] is None and report["ok"] is False
+    assert len(report["steps"]) == 1

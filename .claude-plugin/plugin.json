@@ -1,0 +1,9 @@
+{
+  "name": "windows-computer-use",
+  "version": "0.1.0",
+  "description": "Lets Claude operate Windows desktop apps (look, click, type) through a hardened local MCP server with owner confirmation for critical actions.",
+  "author": { "name": "Burak Erdemci" },
+  "license": "MIT",
+  "repository": "https://github.com/BurakErdemci/claude-windows-computer-use",
+  "keywords": ["windows", "computer-use", "desktop", "mcp", "automation"]
+}

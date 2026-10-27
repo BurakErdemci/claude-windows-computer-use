@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "mcp__plugin_windows-computer-use_desktop__.*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv",
+            "args": ["run", "--directory", "${CLAUDE_PLUGIN_ROOT}", "--frozen", "--quiet", "python", "-m", "windows_computer_use.hook"]
+          }
+        ]
+      }
+    ]
+  }
+}
