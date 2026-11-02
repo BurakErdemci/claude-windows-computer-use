@@ -8,9 +8,11 @@ from . import config, hookcheck
 class LocalApprovals:
     accepts_confirm = True
 
-    def __init__(self, startup_refusal: str | None, hotkey, journal=config.journal_path, confirm_available=None):
+    def __init__(self, startup_refusal: str | None, hotkey, journal=config.journal_path, confirm_available=None,
+                 ownership=None):
         self.startup_refusal = startup_refusal
         self.hotkey = hotkey
+        self.ownership = ownership
         self.journal = journal
         # A legacy startup boolean cannot establish that the hook is still installed.
         # A callable, read on every confirm; a stored boolean would outlive the owner's settings.
@@ -35,7 +37,14 @@ class LocalApprovals:
         if self.startup_refusal:
             self._outcome("preflight", {}, "deny", self.startup_refusal)
             return self.startup_refusal
-        return None
+        refusal = self.ownership.acquire() if self.ownership is not None else None
+        if refusal:
+            self._outcome("preflight", {}, "deny", refusal)
+        return refusal
+
+    def done(self):
+        if self.ownership is not None:
+            self.ownership.done()
 
     async def request(self, tool, params):
         async with self._lock:

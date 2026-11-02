@@ -102,8 +102,7 @@ def test_config_ignores_extra_keys():
     (1, "Computer use is not started while running as administrator."),
     (2, "config.json could not be read"),
     (3, "disabled"),
-    (4, "The stop hotkey (Ctrl+Alt+Esc) could not be registered; computer use was not started."),
-    (5, None),
+    (4, None),
 ])
 def test_startup_refusals_are_ordered(monkeypatch, stage, expected):
     # All later conditions also fail: only the first failing check must win.
@@ -114,21 +113,24 @@ def test_startup_refusals_are_ordered(monkeypatch, stage, expected):
         (config.STATE_DIR / "config.json").write_text("{", encoding="utf-8")
     else:
         write_config(enabled=stage > 3)
-    hotkey = FakeHotkey(registered=stage == 5)
     if expected == "disabled":
         expected = ("Computer use is turned off or its driver is not installed. Ask the user to run this "
                     f"command themselves once (it also turns computer use on): {entry.install_command()}")
-    session_lock = SimpleNamespace(acquire=lambda: True)
-    assert entry._startup_refusal(hotkey, session_lock) == expected
-    assert hotkey.started is (stage >= 4)
+    assert entry._startup_refusal() == expected
 
 
 @windows_only
-def test_main_supplies_local_components_and_stops_hotkey(monkeypatch):
+def test_main_supplies_local_components_and_closes_ownership(monkeypatch):
     write_config()
-    hotkey = FakeHotkey()
+    owned = []
+    class FakeOwnership:
+        def __init__(self):
+            self.closed = False
+            owned.append(self)
+        def close(self):
+            self.closed = True
     calls = {}
-    monkeypatch.setattr(entry, "HaltHotkey", lambda: hotkey)
+    monkeypatch.setattr(entry, "Ownership", FakeOwnership)
     def create(**kwargs):
         calls.update(kwargs)
         return SimpleNamespace(run=lambda **kw: calls.update(kw))
@@ -138,17 +140,19 @@ def test_main_supplies_local_components_and_stops_hotkey(monkeypatch):
     assert isinstance(calls["approvals"], LocalApprovals)
     assert isinstance(calls["runtime"], runtime.StandaloneRuntime)
     assert calls["approvals"].startup_refusal is None
-    assert hotkey.started and hotkey.stopped
+    # Starting the server takes neither the session lock nor the hotkey.
+    assert calls["approvals"].ownership is owned[0] and calls["approvals"].hotkey is owned[0]
+    assert owned[0].closed
 
 
 @windows_only
-def test_main_stops_hotkey_when_server_fails(monkeypatch):
-    hotkey = FakeHotkey()
-    monkeypatch.setattr(entry, "HaltHotkey", lambda: hotkey)
+def test_main_closes_ownership_when_server_fails(monkeypatch):
+    closed = []
+    monkeypatch.setattr(entry, "Ownership", lambda: SimpleNamespace(close=lambda: closed.append(True)))
     monkeypatch.setattr(entry, "create_server", lambda **kw: (_ for _ in ()).throw(RuntimeError("server")))
     with pytest.raises(RuntimeError, match="server"):
         entry.main([])
-    assert hotkey.stopped
+    assert closed == [True]
 
 
 def test_startup_refusal_is_journalled_without_dialog():
@@ -384,13 +388,6 @@ def test_session_lock_excludes_second_session_and_releases():
     finally:
         first.close()
         second.close()
-
-
-def test_lock_refusal_precedes_remaining_startup_checks(monkeypatch):
-    hotkey = FakeHotkey()
-    assert entry._startup_refusal(hotkey, SimpleNamespace(acquire=lambda: False)) == (
-        "Another session is holding computer use.")
-    assert not hotkey.started
 
 
 @pytest.mark.parametrize("mismatch", [None, "wheel", "exe", "written-exe", "written-helper", "replace", "config-replace"])

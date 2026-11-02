@@ -451,6 +451,15 @@ class ComputerServer:
         refusal = self.approvals.preflight()
         if isinstance(refusal, str):
             return _text(refusal, True)
+        try:
+            return await self._call_after_preflight(tool, args)
+        finally:
+            # Ends the "call in flight" mark the approvals object took in preflight.
+            done = getattr(self.approvals, "done", None)
+            if done is not None:
+                done()
+
+    async def _call_after_preflight(self, tool, args):
         confirmed = False
         confirm_text = None
         if getattr(self.approvals, "accepts_confirm", False) and isinstance(args, dict) and "confirm" in args:

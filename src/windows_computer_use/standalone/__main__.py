@@ -13,7 +13,7 @@ from ..platform import _win32
 from ..server import create_server
 from . import config, hookcheck
 from .approvals import LocalApprovals
-from .hotkey import HaltHotkey
+from .ownership import Ownership, SessionLock  # noqa: F401  (SessionLock stays importable from here)
 from .runtime import StandaloneRuntime, install_command
 
 
@@ -25,36 +25,9 @@ INSTRUCTIONS_EXTRA = (
 )
 
 
-class SessionLock:
-    def __init__(self):
-        self.handle = None
-
-    def acquire(self):
-        import msvcrt
-        handle = None
-        try:
-            config.STATE_DIR.mkdir(parents=True, exist_ok=True)
-            handle = (config.STATE_DIR / "server.lock").open("a+b")
-            handle.seek(0)
-            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-        except OSError:
-            if handle is not None:
-                handle.close()
-            return False
-        self.handle = handle
-        return True
-
-    def close(self):
-        if self.handle is not None:
-            self.handle.close()
-            self.handle = None
-
-
-def _startup_refusal(hotkey, session_lock):
+def _startup_refusal():
     if platform.current().name != "win32":
         return "This mode only runs on Windows."
-    if not session_lock.acquire():
-        return "Another session is holding computer use."
     if _win32.self_elevated():
         return "Computer use is not started while running as administrator."
     cfg = config.load()
@@ -64,9 +37,6 @@ def _startup_refusal(hotkey, session_lock):
         # Addressed to the user: turning computer use on is the owner's step, not the agent's.
         return ("Computer use is turned off or its driver is not installed. Ask the user to run this "
                 f"command themselves once (it also turns computer use on): {install_command()}")
-    hotkey.start()
-    if not hotkey.registered:
-        return "The stop hotkey (Ctrl+Alt+Esc) could not be registered; computer use was not started."
     return None
 
 
@@ -132,23 +102,21 @@ def main(argv=None):
     if argv and argv[0] == "install-driver":
         raise SystemExit(_install_driver())
     config.STATE_DIR.mkdir(parents=True, exist_ok=True)
-    hotkey = HaltHotkey()
-    session_lock = SessionLock()
+    ownership = Ownership()
     with config.log_path().open("a", encoding="utf-8") as log:
         previous_stderr = sys.stderr
         sys.stderr = log
         try:
-            refusal = _startup_refusal(hotkey, session_lock)
+            refusal = _startup_refusal()
             confirm_available = hookcheck.confirm_hook_installed()
             instructions = INSTRUCTIONS_EXTRA
             if not confirm_available:
                 instructions += " The confirmation hook is not installed: critical actions cannot be performed in this session."
-            create_server(approvals=LocalApprovals(refusal, hotkey),
+            create_server(approvals=LocalApprovals(refusal, ownership, ownership=ownership),
                           runtime=StandaloneRuntime(), name="windows-computer-use",
                           instructions_extra=instructions).run(transport="stdio")
         finally:
-            hotkey.stop()
-            session_lock.close()
+            ownership.close()
             sys.stderr = previous_stderr
 
 

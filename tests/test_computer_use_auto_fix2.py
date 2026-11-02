@@ -344,9 +344,7 @@ def test_entry_point_sets_hook_availability_and_instructions(monkeypatch, tmp_pa
     monkeypatch.setattr(config, "log_path", lambda: tmp_path / "server.log")
     monkeypatch.setattr(hookcheck, "confirm_hook_installed", lambda: hook)
     monkeypatch.setattr(entry, "_startup_refusal", lambda *args: None)
-    hotkey = SimpleNamespace(stop=lambda: None)
-    monkeypatch.setattr(entry, "HaltHotkey", lambda: hotkey)
-    monkeypatch.setattr(entry, "SessionLock", lambda: SimpleNamespace(close=lambda: None))
+    monkeypatch.setattr(entry, "Ownership", lambda: SimpleNamespace(close=lambda: None))
     captured = {}
     def create(**kwargs):
         captured.update(kwargs)
