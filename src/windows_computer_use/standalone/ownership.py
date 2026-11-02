@@ -4,6 +4,7 @@ Both are system-wide and exclusive, so a server that merely started must not hol
 they are taken on the first tool call and released after a quiet period.
 """
 import datetime
+import errno
 import json
 import os
 import threading
@@ -36,9 +37,12 @@ class SessionLock:
         try:
             handle.seek(0)
             msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-        except OSError:
+        except OSError as exc:
             handle.close()
-            return False
+            # Windows reports a byte range held elsewhere as EACCES (or EDEADLK); anything else is not contention.
+            if exc.errno in (errno.EACCES, errno.EDEADLK):
+                return False
+            raise StateDirError(config.STATE_DIR / "server.lock") from exc
         self.handle = handle
         return True
 
@@ -71,6 +75,8 @@ class Ownership:
         self._last_done = 0.0
         self._acquired_at = None
         self._halted_at = None
+        self._halt_written = False
+        self._retired = []
         self._stop = threading.Event()
         self._thread = None
 
@@ -87,8 +93,15 @@ class Ownership:
 
     def _halted_at_locked(self):
         # The press is remembered here so that it outlives the hotkey that saw it.
-        if self._halted_at is None and self._hotkey is not None:
-            self._halted_at = self._hotkey.halted_at
+        if self._halted_at is None:
+            # Retired hotkeys count too: a press can be processed after stop() gave up joining its thread.
+            for hotkey in ([self._hotkey] if self._hotkey is not None else []) + self._retired:
+                if hotkey.halted_at is not None:
+                    self._halted_at = hotkey.halted_at
+                    break
+        if self._halted_at is not None and not self._halt_written and self._lock is not None:
+            self._halt_written = True
+            self._write_owner()
         return self._halted_at
 
     def acquire(self):
@@ -123,6 +136,7 @@ class Ownership:
                 return "The stop hotkey (Ctrl+Alt+Esc) could not be registered; computer use was not started."
             self._lock, self._hotkey = lock, hotkey
             self._acquired_at = _stamp(_now())
+            self._halt_written = self._halted_at is not None
             self._write_owner()
             self._in_flight += 1
             if self._thread is None:
@@ -145,16 +159,25 @@ class Ownership:
         self._stop.set()
         if self._thread is not None and self._thread is not threading.current_thread():
             self._thread.join(timeout=2)
-        self.release()
+        with self._state:
+            self._release_locked(force=True)
 
-    def _release_locked(self):
+    def _release_locked(self, force=False):
         if self._lock is None:
             return
         # stop() joins the hotkey thread, so a press that raced the release is visible afterwards.
         hotkey, self._hotkey = self._hotkey, None
         hotkey.stop()
+        if hotkey not in self._retired:
+            self._retired.append(hotkey)
         if self._halted_at is None:
             self._halted_at = hotkey.halted_at
+        if self._halted_at is not None and not force:
+            # A halted server keeps the lock until it exits, even when the halt only showed up now.
+            self._hotkey = hotkey
+            self._halt_written = True
+            self._write_owner()
+            return
         # The owner file goes while the lock is still held: once it is free, the next holder writes its own.
         try:
             if json.loads(self._owner_path.read_text(encoding="utf-8")).get("pid") == os.getpid():
@@ -175,6 +198,8 @@ class Ownership:
     def _write_owner(self):
         record = {"pid": os.getpid(), "parent_pid": os.getppid(), "cwd": os.getcwd(),
                   "acquired_at": self._acquired_at, "last_used_at": _stamp(_now())}
+        if self._halted_at is not None:
+            record["halted"] = True
         temp = self._owner_path.with_name(self._owner_path.name + ".tmp")
         try:
             self._owner_path.parent.mkdir(parents=True, exist_ok=True)
@@ -195,6 +220,10 @@ class Ownership:
             seconds = max(0, int((_now() - last).total_seconds()))
             if not isinstance(cwd, str) or not isinstance(owner["pid"], int):
                 raise ValueError
+            if owner.get("halted") is True:
+                return ("Another Claude Code session holds computer use and was stopped with Ctrl+Alt+Esc "
+                        f"(folder: {cwd}). It stays locked until that session restarts its computer-use "
+                        "server (/mcp) or closes.")
         except (OSError, ValueError, KeyError, TypeError, AttributeError):
             return f"Another Claude Code session is using computer use. {tail}"
         return (f"Another Claude Code session is using computer use (folder: {cwd}, "

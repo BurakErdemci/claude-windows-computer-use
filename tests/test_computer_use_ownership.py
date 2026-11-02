@@ -1,6 +1,7 @@
 """Lazy ownership of the session lock and the stop hotkey."""
 import asyncio
 import datetime
+import errno
 import json
 import os
 import sys
@@ -183,7 +184,7 @@ def test_halt_survives_release_and_reacquire(make):
     assert owned.halted_at is None
     FakeHotkey.made[0].halted_at = 12.5
     owned.done()
-    owned.release()
+    owned.close()
     assert FakeLock.held is None and owned.halted_at == 12.5
     assert owned.acquire() is None
     assert FakeHotkey.made[1].halted_at is None and owned.halted_at == 12.5
@@ -205,7 +206,7 @@ def test_halted_owner_keeps_the_lock_past_idle(make, clock):
     clock[0] += 500
     time.sleep(2.5)
     assert FakeLock.held is not None and not FakeHotkey.made[0].stopped
-    assert second.acquire().startswith("Another Claude Code session is using computer use (folder:")
+    assert second.acquire().startswith("Another Claude Code session holds computer use and was stopped with Ctrl+Alt+Esc (folder:")
     first.close()
     assert FakeLock.held is None
 
@@ -412,3 +413,70 @@ def test_server_call_skips_done_when_preflight_refuses():
     approvals = CountingApprovals(preflight="refused")
     assert asyncio.run(make_server(approvals).call("computer_list_apps", {})).is_error
     assert approvals.done_calls == 0
+
+
+def test_busy_message_for_a_halted_holder_names_the_hotkey(make, tmp_path):
+    first, second = make(), make()
+    assert first.acquire() is None
+    FakeHotkey.made[0].halted_at = 5.0
+    assert first.halted_at == 5.0
+    assert json.loads((tmp_path / "server.owner.json").read_text())["halted"] is True
+    message = second.acquire()
+    assert "Ctrl+Alt+Esc" in message and "60 s" not in message and f"folder: {os.getcwd()}" in message
+    assert "/mcp" in message
+
+
+def test_halt_seen_by_the_idle_watcher_marks_the_owner_file(make, tmp_path, clock):
+    owned = make()
+    assert owned.acquire() is None
+    owned.done()
+    FakeHotkey.made[0].halted_at = 5.0
+    assert wait_for(lambda: json.loads((tmp_path / "server.owner.json").read_text()).get("halted") is True)
+
+
+def test_halt_seen_during_idle_release_keeps_the_lock(make, tmp_path):
+    first, second = make(hotkey_factory=PressDuringStopHotkey), make()
+    assert first.acquire() is None
+    first.done()
+    first.release()
+    assert FakeLock.held is not None
+    assert json.loads((tmp_path / "server.owner.json").read_text())["halted"] is True
+    assert first.registered is False and first.halted_at == 9.0
+    assert "Ctrl+Alt+Esc" in second.acquire()
+    first.close()
+    assert FakeLock.held is None
+    assert not (tmp_path / "server.owner.json").exists()
+
+
+def test_late_press_on_a_retired_hotkey_halts_the_server(make):
+    owned = make()
+    assert owned.acquire() is None
+    owned.done()
+    owned.release()
+    assert FakeLock.held is None and owned.halted_at is None
+    FakeHotkey.made[0].halted_at = 7.0
+    assert owned.halted_at == 7.0
+    assert owned.acquire() is None
+    assert owned.halted_at == 7.0
+
+
+class FakeMsvcrt:
+    LK_NBLCK = 2
+
+    def __init__(self, code):
+        self.code = code
+
+    def locking(self, fd, mode, size):
+        raise OSError(self.code, "boom")
+
+
+@pytest.mark.parametrize("code, outcome", [(errno.EACCES, False), (errno.EDEADLK, False), (errno.EIO, StateDirError)])
+def test_session_lock_tells_contention_from_other_lock_errors(monkeypatch, code, outcome):
+    monkeypatch.setitem(sys.modules, "msvcrt", FakeMsvcrt(code))
+    lock = SessionLock()
+    if outcome is StateDirError:
+        with pytest.raises(StateDirError):
+            lock.acquire()
+    else:
+        assert lock.acquire() is False
+    assert lock.handle is None
