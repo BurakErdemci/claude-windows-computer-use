@@ -14,7 +14,7 @@ from mcp.types import CallToolResult
 from windows_computer_use import server
 from windows_computer_use.standalone import config
 from windows_computer_use.standalone.approvals import LocalApprovals
-from windows_computer_use.standalone.ownership import Ownership, SessionLock
+from windows_computer_use.standalone.ownership import Ownership, SessionLock, StateDirError
 
 windows_only = pytest.mark.skipif(sys.platform != "win32", reason="Windows-only")
 
@@ -195,6 +195,73 @@ def test_halt_pressed_just_before_release_is_kept(make):
     FakeHotkey.made[0].halted_at = 3.0
     owned.release()
     assert owned.halted_at == 3.0
+
+
+def test_halted_owner_keeps_the_lock_past_idle(make, clock):
+    first, second = make(), make()
+    assert first.acquire() is None
+    FakeHotkey.made[0].halted_at = 5.0
+    first.done()
+    clock[0] += 500
+    time.sleep(2.5)
+    assert FakeLock.held is not None and not FakeHotkey.made[0].stopped
+    assert second.acquire().startswith("Another Claude Code session is using computer use (folder:")
+    first.close()
+    assert FakeLock.held is None
+
+
+class PressDuringStopHotkey(FakeHotkey):
+    def stop(self):
+        super().stop()
+        self.halted_at = 9.0
+
+
+def test_halt_press_arriving_during_release_is_kept(make):
+    owned = make(hotkey_factory=PressDuringStopHotkey)
+    assert owned.acquire() is None
+    owned.release()
+    assert owned.halted_at == 9.0
+
+
+class ExplodingHotkey(FakeHotkey):
+    def __init__(self):
+        raise RuntimeError("no hotkey")
+
+
+class StartRaisingHotkey(FakeHotkey):
+    def start(self):
+        raise RuntimeError("start failed")
+
+
+@pytest.mark.parametrize("factory", [ExplodingHotkey, StartRaisingHotkey])
+def test_hotkey_that_raises_leaves_the_lock_free(make, factory, tmp_path):
+    owned = make(hotkey_factory=factory)
+    assert owned.acquire() == ("The stop hotkey (Ctrl+Alt+Esc) could not be registered; "
+                               "computer use was not started.")
+    assert FakeLock.held is None
+    assert not (tmp_path / "server.owner.json").exists()
+
+
+class UnwritableLock(FakeLock):
+    def acquire(self):
+        raise StateDirError("C:/nowhere")
+
+
+def test_unusable_state_folder_is_not_reported_as_busy(make):
+    owned = make(lock_factory=UnwritableLock)
+    message = owned.acquire()
+    assert message == ("Computer use cannot use its state folder (C:/nowhere); "
+                       "check that it exists and is writable.")
+    assert FakeHotkey.made == []
+
+
+@windows_only
+def test_session_lock_raises_state_dir_error_under_a_regular_file(tmp_path, monkeypatch):
+    blocker = tmp_path / "file"
+    blocker.write_text("x")
+    monkeypatch.setattr(config, "STATE_DIR", blocker / "state")
+    with pytest.raises(StateDirError):
+        SessionLock().acquire()
 
 
 def test_release_deletes_owner_file_only_if_it_names_our_pid(make, tmp_path):

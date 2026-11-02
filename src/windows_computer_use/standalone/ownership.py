@@ -13,21 +13,31 @@ from . import config
 from .hotkey import HaltHotkey
 
 
+class StateDirError(OSError):
+    """The state folder cannot be created or the lock file cannot be opened."""
+
+    def __init__(self, path):
+        super().__init__(str(path))
+        self.path = path
+
+
 class SessionLock:
     def __init__(self):
         self.handle = None
 
     def acquire(self):
+        """True when taken, False when another process holds it; StateDirError when the folder is unusable."""
         import msvcrt
-        handle = None
         try:
             config.STATE_DIR.mkdir(parents=True, exist_ok=True)
             handle = (config.STATE_DIR / "server.lock").open("a+b")
+        except OSError as exc:
+            raise StateDirError(config.STATE_DIR) from exc
+        try:
             handle.seek(0)
             msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
         except OSError:
-            if handle is not None:
-                handle.close()
+            handle.close()
             return False
         self.handle = handle
         return True
@@ -87,13 +97,28 @@ class Ownership:
                 self._in_flight += 1
                 return None
             lock = self._lock_factory()
-            if not lock.acquire():
+            try:
+                taken = lock.acquire()
+            except StateDirError as exc:
+                lock.close()
+                return (f"Computer use cannot use its state folder ({exc.path}); "
+                        "check that it exists and is writable.")
+            if not taken:
                 lock.close()
                 return self._busy_message()
-            hotkey = self._hotkey_factory()
-            hotkey.start()
-            if not hotkey.registered:
-                hotkey.stop()
+            hotkey = None
+            try:
+                hotkey = self._hotkey_factory()
+                hotkey.start()
+                registered = hotkey.registered
+            except Exception:
+                registered = False
+            if not registered:
+                if hotkey is not None:
+                    try:
+                        hotkey.stop()
+                    except Exception:
+                        pass
                 lock.close()
                 return "The stop hotkey (Ctrl+Alt+Esc) could not be registered; computer use was not started."
             self._lock, self._hotkey = lock, hotkey
@@ -125,21 +150,25 @@ class Ownership:
     def _release_locked(self):
         if self._lock is None:
             return
-        self._halted_at_locked()
-        self._hotkey.stop()
-        self._hotkey = None
-        self._lock.close()
-        self._lock = None
+        # stop() joins the hotkey thread, so a press that raced the release is visible afterwards.
+        hotkey, self._hotkey = self._hotkey, None
+        hotkey.stop()
+        if self._halted_at is None:
+            self._halted_at = hotkey.halted_at
+        # The owner file goes while the lock is still held: once it is free, the next holder writes its own.
         try:
             if json.loads(self._owner_path.read_text(encoding="utf-8")).get("pid") == os.getpid():
                 self._owner_path.unlink()
         except (OSError, ValueError, AttributeError):
             pass
+        self._lock.close()
+        self._lock = None
 
     def _watch_idle(self):
         while not self._stop.wait(1):
             with self._state:
-                if (self._lock is not None and self._in_flight == 0
+                # A halted server keeps the lock until it exits, so no session resumes without a restart.
+                if (self._lock is not None and self._in_flight == 0 and self._halted_at_locked() is None
                         and self._clock() - self._last_done >= self.idle_seconds):
                     self._release_locked()
 
